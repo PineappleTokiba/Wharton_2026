@@ -25,6 +25,24 @@ Each symbol is saved as `data/prices/<TICKER>.csv`, with `date`, `ticker`, `adj_
 
 The cache provides market data only. Add point-in-time sector classifications separately, then combine the per-ticker files into the stock and benchmark tables described below. A supplied list of today's tickers does not establish historical index membership; using it for the full history can introduce survivorship bias, so obtain historical eligible-universe membership where possible.
 
+## Running the starter GNN experiment
+
+Install the project dependencies and make sure `data/prices/` contains the stocks in your universe plus SPY:
+
+```bash
+python -m pip install -r requirements.txt
+python src/download_prices.py tickers.txt --start 2018-01-01
+python -m src.gnn_framework --data-dir data/prices --benchmark SPY
+```
+
+The GNN command writes model checkpoints, the saved experiment configuration, out-of-sample monthly returns, portfolio summary metrics, and ranking metrics under `reports/gnn/`. It compares a weighted two-layer graph convolution with an MLP that receives the same node features but no graph edges, equal weighting, and cached SPY/QQQ benchmarks. QQQ is included only when a QQQ CSV exists in the price cache. The default experiment uses a 60/20/20 chronological split; label windows crossing split boundaries are purged. Features and correlations use only data through the close before each simulated rebalance close. The test period is held out from training and validation.
+
+The first version uses 21-session return, 63-session annualized volatility, and recent-versus-prior average-volume change. It creates monthly graphs from positive trailing return correlations, keeps the strongest neighbors, and trains on the binary target of beating SPY over the following 21 sessions. The default transaction-cost assumption is 10 basis points per dollar traded, one-way. Change settings with CLI options such as `--top-k`, `--max-position`, `--max-sector`, `--cost-rate`, and `--edges-per-node`; record all selected settings when interpreting a run.
+
+Sector limits can only be enforced if the price CSVs contain a historical `sector` column. Without sector data, the framework warns and cannot apply sector caps. In that case, add point-in-time sector classifications before interpreting the portfolio as sector-diversified. A ticker list containing today's stocks is also not a historical constituent list: survivorship bias remains unless historical universe eligibility is supplied.
+
+The current working cache is only a small smoke-test universe (AAPL, MSFT, NVDA, and SPY), with no QQQ or sector classifications. It is not enough to treat results as a credible investment backtest. The framework requires at least two stocks to form a graph and at least ten labeled monthly snapshots to perform chronological splits; use the intended 50-100 stock universe and inspect the saved test window and metrics before drawing conclusions. This is a research example, not investment advice.
+
 Use two point-in-time tables. One row per stock/date in the first table, and one row per date in the second:
 
 **`prices.csv`**
@@ -149,6 +167,7 @@ Report at minimum: cumulative return, annualized return, annualized volatility, 
 data/                 # supplied input files; keep raw files unchanged
 src/
   download_prices.py # downloads supplied tickers and caches adjusted prices/volume
+  gnn_framework.py  # point-in-time graphs, training, portfolio, and backtest
   data.py             # schema checks, returns, date alignment
   snapshots.py        # point-in-time features, labels, and graph edges
   models.py           # GNN and non-graph model
@@ -158,6 +177,7 @@ src/
 configs/
   experiment.yaml     # windows, split dates, model and portfolio choices
 tests/
+  test_gnn_framework.py
   test_no_lookahead.py
   test_graph.py
   test_portfolio.py
