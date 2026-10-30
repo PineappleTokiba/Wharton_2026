@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from data_pipeline import Snapshot
+from src.preprocessing import Snapshot
 
 def predict_probabilities(
     model: torch.nn.Module, snapshots: Sequence[Snapshot], mean: np.ndarray, standard_deviation: np.ndarray

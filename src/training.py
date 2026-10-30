@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from torch import nn
-from data_pipeline import Snapshot
+from src.preprocessing import Snapshot
 
 class GraphConvolution(nn.Module):
     def __init__(self, input_size: int, output_size: int) -> None:

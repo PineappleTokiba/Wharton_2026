@@ -93,11 +93,34 @@ def correlation_adjacency(correlations: np.ndarray, edges_per_node: int) -> np.n
     normalized = inverse_sqrt_degree[:, None] * adjacency * inverse_sqrt_degree[None, :]
     return normalized.astype(np.float32)
 
+def chronological_split(
+    snapshots: Sequence[Snapshot],
+    train_fraction: float = 0.60,
+    validation_fraction: float = 0.20,
+) -> Tuple[List[Snapshot], List[Snapshot], List[Snapshot]]:
+    """Splits snapshots chronologically into train, validation, and test sets,
+    purging overlapping forward label horizons to prevent data leakage.
+    """
+    ordered = sorted(snapshots, key=lambda s: s.date)
+    val_index = int(len(ordered) * train_fraction)
+    test_index = int(len(ordered) * (train_fraction + validation_fraction))
+    
+    if val_index >= len(ordered) or test_index >= len(ordered):
+        raise ValueError("Not enough snapshots to perform chronological split with current fractions.")
+        
+    val_start, test_start = ordered[val_index].date, ordered[test_index].date
+    
+    train = [item for item in ordered[:val_index] if item.target_end < val_start]
+    validation = [item for item in ordered[val_index:test_index] if item.date >= val_start and item.target_end < test_start]
+    test = [item for item in ordered[test_index:] if item.date >= test_start]
+    
+    return train, validation, test
+
 def build_snapshots(
     prices: pd.DataFrame,
     volumes: pd.DataFrame,
     benchmark_prices: pd.DataFrame,
-    optional_panels: Dict[str, pd.DataFrame],
+    optional_panels: Dict[str, pd.DataFrame] = None,
     benchmark_ticker: str = "SPY",
     qqq_ticker: str = "QQQ",
     correlation_window: int = 60,
