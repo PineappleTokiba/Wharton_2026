@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
@@ -6,7 +5,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-FEATURE_NAMES = ("return_21d", "volatility_63d", "volume_change")
+FEATURE_CONFIG = {
+    "return_21d": {"enabled": False, "weight": 1.0},
+    "volatility_63d": {"enabled": False, "weight": 1.0},
+    "volume_change": {"enabled": False, "weight": 1.0},
+    "beta": {"enabled": False, "weight": 1.5},  
+    "pe_ratio": {"enabled": False, "weight": 0.8},  
+}
+
 REQUIRED_COLUMNS = {"date", "ticker", "adj_close", "volume"}
 
 @dataclass
@@ -25,7 +31,7 @@ class Snapshot:
 
 def load_price_cache(
     cache_dir: Path, benchmark_ticker: str = "SPY"
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, pd.DataFrame]]:
     if not cache_dir.is_dir():
         raise FileNotFoundError(f"Price-cache directory does not exist: {cache_dir}")
     files = sorted(cache_dir.glob("*.csv"))
@@ -46,15 +52,27 @@ def load_price_cache(
 
     panel = pd.concat(frames, ignore_index=True)
     benchmark_ticker = benchmark_ticker.upper()
+    
     all_prices = panel.pivot(index="date", columns="ticker", values="adj_close").sort_index()
     all_volumes = panel.pivot(index="date", columns="ticker", values="volume").sort_index()
-    all_sectors = (
-        panel.pivot(index="date", columns="ticker", values="sector").sort_index()
-        if "sector" in panel.columns
-        else pd.DataFrame(index=all_prices.index)
-    )
+    
+    # Optional columns check
+    optional_panels = {}
+    for col in ["sector", "beta", "pe_ratio"]:
+        if col in panel.columns:
+            optional_panels[col] = panel.pivot(index="date", columns="ticker", values=col).sort_index()
+            
     stock_columns = [col for col in all_prices.columns if col != benchmark_ticker]
-    return all_prices[stock_columns], all_volumes[stock_columns], all_prices, all_sectors.reindex(columns=stock_columns) if not all_sectors.empty else pd.DataFrame(index=all_prices.index, columns=stock_columns)
+    
+    sectors = optional_panels.get("sector", pd.DataFrame(index=all_prices.index)).reindex(columns=stock_columns)
+    
+    return (
+        all_prices[stock_columns], 
+        all_volumes[stock_columns], 
+        all_prices, 
+        sectors,
+        optional_panels
+    )
 
 def correlation_adjacency(correlations: np.ndarray, edges_per_node: int) -> np.ndarray:
     node_count = correlations.shape[0]
@@ -79,6 +97,7 @@ def build_snapshots(
     prices: pd.DataFrame,
     volumes: pd.DataFrame,
     benchmark_prices: pd.DataFrame,
+    optional_panels: Dict[str, pd.DataFrame],
     benchmark_ticker: str = "SPY",
     qqq_ticker: str = "QQQ",
     correlation_window: int = 60,
@@ -88,6 +107,7 @@ def build_snapshots(
     sectors: Optional[pd.DataFrame] = None,
 ) -> List[Snapshot]:
     daily_returns = prices.pct_change(fill_method=None)
+    benchmark_returns = benchmark_prices[benchmark_ticker].pct_change(fill_method=None)
     dates = prices.index
     monthly_indices = pd.Series(np.arange(len(dates)), index=dates).groupby(dates.to_period("M")).last()
     snapshots: List[Snapshot] = []
@@ -137,20 +157,55 @@ def build_snapshots(
             ):
                 continue
                 
-            node_features = [
-                float(current_price / start_price - 1.0),
-                float(recent_returns.std(ddof=1) * np.sqrt(252.0)),
-                float(recent_volumes.mean() / prior_volumes.mean() - 1.0),
-            ]
-            if not np.isfinite(node_features).all():
+            # Compute base metrics
+            ret_21d = float(current_price / start_price - 1.0)
+            vol_63d = float(recent_returns.std(ddof=1) * np.sqrt(252.0))
+            vol_change = float(recent_volumes.mean() / prior_volumes.mean() - 1.0)
+            
+            # Compute or lookup Beta dynamically if enabled and not in panel
+            beta_val = 1.0
+            if FEATURE_CONFIG["beta"]["enabled"]:
+                if "beta" in optional_panels and ticker in optional_panels["beta"].columns and feature_date in optional_panels["beta"].index:
+                    beta_val = float(optional_panels["beta"].at[feature_date, ticker])
+                else:
+                    # Fallback: calculate rolling beta against SPY
+                    m_ret = benchmark_returns.iloc[feature_index - 62 : feature_index + 1]
+                    valid_pair = pd.concat([recent_returns, m_ret], axis=1).dropna()
+                    if len(valid_pair) > 30:
+                        cov = np.cov(valid_pair.iloc[:, 0], valid_pair.iloc[:, 1])[0, 1]
+                        m_var = valid_pair.iloc[:, 1].var()
+                        beta_val = float(cov / m_var) if m_var > 0 else 1.0
+
+            # Lookup P/E ratio if enabled and present in data
+            pe_val = 0.0
+            if FEATURE_CONFIG["pe_ratio"]["enabled"]:
+                if "pe_ratio" in optional_panels and ticker in optional_panels["pe_ratio"].columns and feature_date in optional_panels["pe_ratio"].index:
+                    pe_val = float(optional_panels["pe_ratio"].at[feature_date, ticker])
+
+            # Assemble node feature vector based on active config and weights
+            node_features = []
+            if FEATURE_CONFIG["return_21d"]["enabled"]:
+                node_features.append(ret_21d * FEATURE_CONFIG["return_21d"]["weight"])
+            if FEATURE_CONFIG["volatility_63d"]["enabled"]:
+                node_features.append(vol_63d * FEATURE_CONFIG["volatility_63d"]["weight"])
+            if FEATURE_CONFIG["volume_change"]["enabled"]:
+                node_features.append(vol_change * FEATURE_CONFIG["volume_change"]["weight"])
+            if FEATURE_CONFIG["beta"]["enabled"]:
+                node_features.append(beta_val * FEATURE_CONFIG["beta"]["weight"])
+            if FEATURE_CONFIG["pe_ratio"]["enabled"]:
+                node_features.append(pe_val * FEATURE_CONFIG["pe_ratio"]["weight"])
+
+            node_features_arr = np.asarray(node_features, dtype=np.float32)
+            if not np.isfinite(node_features_arr).all():
                 continue
+                
             stock_return = float(end_price / execution_price - 1.0)
             if not np.isfinite(stock_return):
                 continue
                 
             valid_tickers.append(str(ticker))
             valid_indices.append(ticker_index)
-            features.append(node_features)
+            features.append(node_features_arr)
             stock_forward_returns.append(stock_return)
             
             sector: Optional[str] = None
@@ -176,18 +231,3 @@ def build_snapshots(
             )
         )
     return snapshots
-
-def chronological_split(
-    snapshots: Sequence[Snapshot],
-    train_fraction: float = 0.60,
-    validation_fraction: float = 0.20,
-) -> Tuple[List[Snapshot], List[Snapshot], List[Snapshot]]:
-    ordered = sorted(snapshots, key=lambda s: s.date)
-    val_index = int(len(ordered) * train_fraction)
-    test_index = int(len(ordered) * (train_fraction + validation_fraction))
-    val_start, test_start = ordered[val_index].date, ordered[test_index].date
-    
-    train = [item for item in ordered[:val_index] if item.target_end < val_start]
-    validation = [item for item in ordered[val_index:test_index] if item.date >= val_start and item.target_end < test_start]
-    test = [item for item in ordered[test_index:] if item.date >= test_start]
-    return train, validation, test
