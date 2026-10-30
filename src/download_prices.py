@@ -1,4 +1,5 @@
 """Download yfinance price history into a per-ticker CSV cache."""
+#python src/download_prices.py tickers.txt --start 2018-01-01
 
 from __future__ import annotations
 
@@ -13,6 +14,8 @@ import pandas as pd
 import yfinance as yf
 
 CACHE_COLUMNS = ["date", "ticker", "adj_close", "volume"]
+SECTOR_COLUMN = "sector"
+BENCHMARK_TICKERS = {"SPY", "QQQ"}
 TICKER_PATTERN = re.compile(r"^[A-Z0-9.^=-]+$")
 
 
@@ -94,14 +97,39 @@ def _normalize_download(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return result[CACHE_COLUMNS]
 
 
+def _fetch_sector(ticker: str) -> Optional[str]:
+    """Fetch the current company sector from Yahoo Finance metadata."""
+    try:
+        info = yf.Ticker(ticker).get_info()
+    except Exception as error:
+        raise RuntimeError(f"Could not retrieve Yahoo Finance metadata for {ticker}") from error
+
+    sector = info.get("sector") if isinstance(info, dict) else None
+    if sector is None or not str(sector).strip():
+        if ticker not in BENCHMARK_TICKERS:
+            print(f"Warning: Yahoo Finance did not provide a sector for {ticker}.")
+        return None
+    return str(sector).strip()
+
+
+def _save_cache(data: pd.DataFrame, cache_path: Path) -> None:
+    temporary_path = cache_path.with_suffix(".csv.tmp")
+    try:
+        data.to_csv(temporary_path, index=False)
+        temporary_path.replace(cache_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def cache_tickers(
     tickers: list[str],
     cache_dir: Path,
     start: str,
     end: Optional[str] = None,
     refresh: bool = False,
+    refresh_sectors: bool = False,
 ) -> None:
-    """Cache adjusted daily closes and volume, downloading only missing tickers."""
+    """Cache adjusted prices and attach Yahoo's current sector to each row."""
     start_date = date.fromisoformat(start)
     end_date = date.fromisoformat(end) if end else None
     if end_date is not None and end_date <= start_date:
@@ -121,26 +149,35 @@ def cache_tickers(
                     f"Cache file is empty or has unexpected schema/content: {cache_path}. "
                     "Use --refresh to replace it."
                 )
-            print(f"Using cache: {cache_path}")
-            continue
+            has_sector = SECTOR_COLUMN in cached.columns and (
+                ticker in BENCHMARK_TICKERS
+                or cached[SECTOR_COLUMN].fillna("").astype(str).str.strip().ne("").all()
+            )
+            if has_sector and not refresh_sectors:
+                print(f"Using cache: {cache_path}")
+                continue
+            normalized = cached
+            print(f"Using cached prices; retrieving sector metadata for {ticker}...")
+        else:
+            print(f"Downloading {ticker}...")
+            downloaded = yf.download(
+                ticker,
+                start=start,
+                end=end,
+                auto_adjust=True,
+                actions=False,
+                progress=False,
+                threads=False,
+            )
+            normalized = _normalize_download(downloaded, ticker)
 
-        print(f"Downloading {ticker}...")
-        downloaded = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            auto_adjust=True,
-            actions=False,
-            progress=False,
-            threads=False,
-        )
-        normalized = _normalize_download(downloaded, ticker)
-        temporary_path = cache_path.with_suffix(".csv.tmp")
-        try:
-            normalized.to_csv(temporary_path, index=False)
-            temporary_path.replace(cache_path)
-        finally:
-            temporary_path.unlink(missing_ok=True)
+        if ticker in BENCHMARK_TICKERS:
+            normalized[SECTOR_COLUMN] = None
+        elif refresh_sectors or SECTOR_COLUMN not in normalized.columns or (
+            normalized[SECTOR_COLUMN].fillna("").astype(str).str.strip().eq("").any()
+        ):
+            normalized[SECTOR_COLUMN] = _fetch_sector(ticker)
+        _save_cache(normalized, cache_path)
         print(f"Saved cache: {cache_path}")
 
 
@@ -165,6 +202,11 @@ def main() -> None:
         action="store_true",
         help="Re-download all tickers, replacing their cached CSV files",
     )
+    parser.add_argument(
+        "--refresh-sectors",
+        action="store_true",
+        help="Refresh current Yahoo sector metadata without re-downloading prices",
+    )
     args = parser.parse_args()
 
     tickers = load_tickers(args.tickers_file)
@@ -174,7 +216,14 @@ def main() -> None:
     if benchmark and benchmark not in tickers:
         tickers.append(benchmark)
 
-    cache_tickers(tickers, args.cache_dir, args.start, args.end, args.refresh)
+    cache_tickers(
+        tickers,
+        args.cache_dir,
+        args.start,
+        args.end,
+        args.refresh,
+        args.refresh_sectors,
+    )
 
 
 if __name__ == "__main__":

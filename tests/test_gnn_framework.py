@@ -1,12 +1,29 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 
+<<<<<<< HEAD
 from src.preprocessing import Snapshot, build_snapshots, chronological_split, correlation_adjacency
 from src.training import StockGNN, standardization_parameters, train_model
 from src.analysis import portfolio_backtest, portfolio_weights
+=======
+from src.gnn_framework import (
+    Snapshot,
+    StockGNN,
+    build_snapshots,
+    chronological_split,
+    correlation_adjacency,
+    plot_backtest_results,
+    portfolio_backtest,
+    portfolio_weights,
+    standardization_parameters,
+    train_model,
+)
+>>>>>>> 189ef3a (hi)
 
 
 def synthetic_panels(days=900):
@@ -102,7 +119,7 @@ class GNNFrameworkTests(unittest.TestCase):
             stock_returns=np.array([0.1, 0.0], dtype=np.float32),
             spy_return=0.02,
             qqq_return=None,
-            sectors=(None, None),
+            sectors=("Technology", "Health Care"),
         )
 
         result = portfolio_backtest(
@@ -118,6 +135,38 @@ class GNNFrameworkTests(unittest.TestCase):
         self.assertAlmostEqual(result.loc[0, "turnover"], 1.0)
         self.assertAlmostEqual(result.loc[0, "transaction_cost"], 0.001)
         self.assertAlmostEqual(result.loc[0, "net_return"], 0.049)
+
+    def test_missing_sectors_share_unknown_sector_cap(self):
+        weights = portfolio_weights(
+            ["A", "B", "C"],
+            np.array([0.9, 0.8, 0.7]),
+            [None, None, "Health Care"],
+            top_k=3,
+            max_position=0.5,
+            max_sector=0.3,
+        )
+
+        self.assertAlmostEqual(weights["A"], 0.3)
+        self.assertNotIn("B", weights)
+        self.assertAlmostEqual(weights["C"], 0.3)
+
+    def test_plot_backtest_results_writes_png_chart(self):
+        backtest = pd.DataFrame(
+            [
+                {"date": "2024-01-31", "strategy": "gnn", "net_return": 0.05},
+                {"date": "2024-02-29", "strategy": "gnn", "net_return": -0.02},
+                {"date": "2024-01-31", "strategy": "SPY", "net_return": 0.01},
+                {"date": "2024-02-29", "strategy": "SPY", "net_return": 0.03},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "performance.png"
+
+            plot_backtest_results(backtest, output_path)
+
+            self.assertTrue(output_path.is_file())
+            self.assertGreater(output_path.stat().st_size, 1000)
+            self.assertEqual(output_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
     def test_gnn_trains_on_synthetic_snapshots(self):
         snapshots = []

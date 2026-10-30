@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -465,7 +468,7 @@ def portfolio_weights(
     for index in selected:
         ticker = tickers[int(index)]
         sector = sectors[int(index)]
-        sector_key = sector if sector is not None else f"__unknown__:{ticker}"
+        sector_key = sector if sector is not None else "__unknown__"
         sector_room = max_sector - sector_totals.get(sector_key, 0.0)
         weight = max(0.0, min(target_weight, max_position, sector_room))
         if weight > 0:
@@ -611,6 +614,59 @@ def performance_summary(backtest: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(summaries)
 
 
+def plot_backtest_results(backtest: pd.DataFrame, output_path: Path) -> None:
+    """Save compounded snapshot returns and drawdowns as a two-panel chart."""
+    required = {"date", "strategy", "net_return"}
+    missing = required.difference(backtest.columns)
+    if missing:
+        raise ValueError(f"Backtest data is missing columns: {sorted(missing)}")
+    if backtest.empty:
+        raise ValueError("Cannot plot empty backtest results")
+
+    chart_data = backtest.copy()
+    chart_data["date"] = pd.to_datetime(chart_data["date"], errors="raise")
+    chart_data["net_return"] = pd.to_numeric(chart_data["net_return"], errors="raise")
+    if not np.isfinite(chart_data["net_return"]).all() or (
+        chart_data["net_return"] <= -1
+    ).any():
+        raise ValueError("Backtest returns must be finite and greater than -100%")
+
+    figure, (equity_axis, drawdown_axis) = plt.subplots(
+        2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [2, 1]}
+    )
+    for strategy, group in chart_data.groupby("strategy", sort=True):
+        group = group.sort_values("date")
+        returns = group["net_return"].to_numpy(dtype=float)
+        equity = np.concatenate(([1.0], np.cumprod(1.0 + returns)))
+        dates = [group["date"].iloc[0] - pd.Timedelta(days=1)] + group["date"].tolist()
+        drawdown = equity / np.maximum.accumulate(equity) - 1.0
+        equity_axis.plot(dates, (equity - 1.0) * 100.0, label=strategy, linewidth=1.8)
+        drawdown_axis.plot(dates, drawdown * 100.0, label=strategy, linewidth=1.4)
+
+    equity_axis.set_title("Out-of-sample strategy comparison")
+    equity_axis.set_ylabel("Compounded return (%)")
+    equity_axis.axhline(0, color="black", linewidth=0.8, alpha=0.5)
+    equity_axis.grid(True, alpha=0.25)
+    equity_axis.legend(ncol=3, frameon=False)
+    drawdown_axis.set_title("Drawdown")
+    drawdown_axis.set_ylabel("From prior peak (%)")
+    drawdown_axis.set_xlabel("Rebalance date")
+    drawdown_axis.grid(True, alpha=0.25)
+    drawdown_axis.legend(ncol=3, frameon=False)
+    figure.text(
+        0.5,
+        0.01,
+        "Caution: these values compound 21-session forward returns at monthly snapshots; "
+        "windows may overlap or leave gaps and are not a contiguous investable return series.",
+        ha="center",
+        fontsize=8,
+    )
+    figure.tight_layout(rect=(0, 0.04, 1, 1))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(figure)
+
+
 def ranking_summary(
     snapshots: Sequence[Snapshot],
     predictions: Sequence[np.ndarray],
@@ -672,10 +728,11 @@ def run_experiment(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame
             "pipeline smoke test, not as evidence of strategy performance.",
             RuntimeWarning,
         )
-    if sectors.isna().all().all():
+    if sectors.isna().any().any():
         warnings.warn(
-            "No sector classifications found. Sector limits cannot be enforced; "
-            "provide sector columns in the price CSVs before relying on sector diversification.",
+            "Some sector classifications are missing. Those stocks are grouped into a shared "
+            "Unknown sector bucket; provide historical sector classifications for reliable "
+            "sector diversification.",
             RuntimeWarning,
         )
     snapshots = build_snapshots(
@@ -760,6 +817,7 @@ def run_experiment(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame
     args.output_dir.mkdir(parents=True, exist_ok=True)
     results.to_csv(args.output_dir / "out_of_sample_returns.csv", index=False)
     summary.to_csv(args.output_dir / "summary.csv", index=False)
+    plot_backtest_results(results, args.output_dir / "performance.png")
 
     config = vars(args).copy()
     config["data_dir"] = str(args.data_dir)
@@ -805,8 +863,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=0.001,
         help="Transaction cost per dollar traded (0.001 means 10 bps, one-way).",
     )
-    parser.add_argument("--train-fraction", type=float, default=0.60)
-    parser.add_argument("--validation-fraction", type=float, default=0.20)
+    parser.add_argument("--train-fraction", type=float, default=0.25)
+    parser.add_argument("--validation-fraction", type=float, default=0.10)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--learning-rate", type=float, default=0.01)
