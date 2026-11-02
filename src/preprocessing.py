@@ -127,10 +127,10 @@ def build_snapshots(
     optional_panels: Dict[str, pd.DataFrame] = None,
     benchmark_ticker: str = "SPY",
     qqq_ticker: str = "QQQ",
-    correlation_window: int = 52,        # 52 weeks (~1 year) for long-term correlation structure
-    edges_per_node: int = 5,
-    minimum_correlation_observations: int = 40,
-    horizon: int = 12,                  # 12 weeks (~3 months) forward holding horizon for long-term picks
+    correlation_window: int = 104,        # 52 weeks (~1 year) for long-term correlation structure
+    edges_per_node: int = 7,
+    minimum_correlation_observations: int = 80,
+    horizon: int = 52,                  # 12 weeks (~3 months) forward holding horizon for long-term picks
     sectors: Optional[pd.DataFrame] = None,
 ) -> List[Snapshot]:
     weekly_returns = prices.pct_change(fill_method=None)

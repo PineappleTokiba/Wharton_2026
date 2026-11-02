@@ -17,7 +17,7 @@ from src.analysis import predict_probabilities, portfolio_backtest, performance_
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run GCN stock prediction and portfolio backtest pipeline.")
-    parser.add_argument("--cache-dir", type=Path, default=Path("data/prices"), help="Directory containing cached ticker CSVs")
+    parser.add_argument("--cache-dir", type=Path, default=Path("stock_data"), help="Directory containing cached ticker CSVs")
     parser.add_argument("--benchmark", default="SPY", help="Benchmark ticker")
     parser.add_argument("--model-type", choices=["gcn", "mlp"], default="gcn", help="Model architecture to train")
     parser.add_argument("--epochs", type=int, default=150, help="Maximum training epochs")
@@ -85,7 +85,10 @@ def main() -> None:
     print("STEP 6: Running Portfolio Backtest on Test Set...")
     print("=" * 60)
     test_predictions = predict_probabilities(model, test_snapshots, mean, std)
-    
+    # Save the trained model weights to disk
+    model_path = Path("gcn_stock_model.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"Model successfully saved to {model_path}")
     # Backtest GCN / Model Strategy
     gcn_backtest = portfolio_backtest(
         snapshots=test_snapshots,
