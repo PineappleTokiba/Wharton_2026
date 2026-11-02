@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import numpy as np
+import sys
+
 import pandas as pd
-import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.preprocessing import load_price_cache, build_snapshots, chronological_split
-from src.model import StockGNN, NodeMLP, standardization_parameters, train_model
+from src.training import StockGNN, NodeMLP, standardization_parameters, train_model
 from src.analysis import predict_probabilities, portfolio_backtest, performance_summary, get_snapshot_rankings
 
 
