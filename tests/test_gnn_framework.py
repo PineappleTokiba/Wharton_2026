@@ -6,24 +6,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-<<<<<<< HEAD
 from src.preprocessing import Snapshot, build_snapshots, chronological_split, correlation_adjacency
 from src.training import StockGNN, standardization_parameters, train_model
 from src.analysis import portfolio_backtest, portfolio_weights
-=======
-from src.gnn_framework import (
-    Snapshot,
-    StockGNN,
-    build_snapshots,
-    chronological_split,
-    correlation_adjacency,
-    plot_backtest_results,
-    portfolio_backtest,
-    portfolio_weights,
-    standardization_parameters,
-    train_model,
-)
->>>>>>> 189ef3a (hi)
 
 
 def synthetic_panels(days=900):

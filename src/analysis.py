@@ -1,10 +1,13 @@
+"""Portfolio backtesting, performance summary, and GCN ranking analysis for weekly stock models."""
 
 from __future__ import annotations
+
 from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
 from src.preprocessing import Snapshot
+
 
 def predict_probabilities(
     model: torch.nn.Module, snapshots: Sequence[Snapshot], mean: np.ndarray, standard_deviation: np.ndarray
@@ -18,12 +21,13 @@ def predict_probabilities(
             predictions.append(torch.sigmoid(logits).cpu().numpy())
     return predictions
 
+
 def portfolio_weights(
     tickers: Sequence[str], probabilities: np.ndarray, sectors: Sequence[Optional[str]],
     top_k: int = 10, max_position: float = 0.10, max_sector: float = 0.25
 ) -> Dict[str, float]:
     selected = np.argsort(-probabilities, kind="stable")[:top_k]
-    target_weight = 1.0 / len(selected)
+    target_weight = 1.0 / len(selected) if len(selected) > 0 else 0.0
     weights: Dict[str, float] = {}
     sector_totals: Dict[str, float] = {}
     for index in selected:
@@ -36,6 +40,7 @@ def portfolio_weights(
             weights[ticker] = weight
             sector_totals[sector_key] = sector_totals.get(sector_key, 0.0) + weight
     return weights
+
 
 def portfolio_backtest(
     snapshots: Sequence[Snapshot], predictions: Sequence[np.ndarray], strategy: str,
@@ -56,16 +61,23 @@ def portfolio_backtest(
         turnover = sum(abs(weights.get(s, 0.0) - previous_weights.get(s, 0.0)) for s in symbols)
         transaction_cost = turnover * cost_rate
         
+        weights_sum = sum(weights.values())
         records.append({
-            "date": snapshot.date, "target_end": snapshot.target_end, "strategy": strategy,
-            "gross_return": gross_return, "net_return": gross_return - transaction_cost,
-            "turnover": turnover, "transaction_cost": transaction_cost,
-            "holdings": len(weights), "cash_weight": max(0.0, 1.0 - sum(weights.values()))
+            "date": snapshot.date,
+            "target_end": snapshot.target_end,
+            "strategy": strategy,
+            "gross_return": gross_return,
+            "net_return": gross_return - transaction_cost,
+            "turnover": turnover,
+            "transaction_cost": transaction_cost,
+            "holdings": len(weights),
+            "cash_weight": max(0.0, 1.0 - weights_sum),
         })
         previous_weights = weights
     return pd.DataFrame(records)
 
-def performance_summary(backtest: pd.DataFrame) -> pd.DataFrame:
+
+def performance_summary(backtest: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     summaries: List[dict] = []
     for strategy, group in backtest.groupby("strategy", sort=True):
         returns = group.sort_values("date")["net_return"].astype(float).to_numpy()
@@ -79,11 +91,43 @@ def performance_summary(backtest: pd.DataFrame) -> pd.DataFrame:
         sharpe = (float(np.mean(returns) / np.std(returns, ddof=1) * np.sqrt(12.0)) if len(returns) > 1 and np.std(returns, ddof=1) > 0 else 0.0)
         
         summaries.append({
-            "strategy": strategy, "periods": len(returns), "cumulative_return": float(equity[-1] - 1.0),
-            "annualized_return": annualized_return, "annualized_volatility": volatility,
-            "sharpe_rf_0": sharpe, "max_drawdown": float(drawdowns.min()),
+            "strategy": strategy,
+            "periods": len(returns),
+            "cumulative_return": float(equity[-1] - 1.0),
+            "annualized_return": annualized_return,
+            "annualized_volatility": volatility,
+            "sharpe_rf_0": sharpe,
+            "max_drawdown": float(drawdowns.min()),
             "average_turnover": float(group["turnover"].mean()),
             "total_transaction_cost": float(group["transaction_cost"].sum()),
             "average_holdings": float(group["holdings"].mean())
         })
     return pd.DataFrame(summaries)
+
+
+def get_snapshot_rankings(
+    snapshot: Snapshot, probabilities: np.ndarray, top_n: int = 15
+) -> pd.DataFrame:
+    """Extracts and ranks stocks for a given snapshot by GCN outperformance probability.
+    Useful for inspecting top long-term picks, their predicted probability, sector, and actual return.
+    """
+    sorted_indices = np.argsort(-probabilities)
+    rankings = []
+    
+    for rank, idx in enumerate(sorted_indices[:top_n], start=1):
+        ticker = snapshot.tickers[idx]
+        sector = snapshot.sectors[idx] if idx < len(snapshot.sectors) else None
+        prob = float(probabilities[idx])
+        actual_ret = float(snapshot.stock_returns[idx])
+        label = int(snapshot.labels[idx])
+        
+        rankings.append({
+            "rank": rank,
+            "ticker": ticker,
+            "sector": sector if sector else "Unknown",
+            "gcn_probability": prob,
+            "actual_return": actual_ret,
+            "beat_benchmark": bool(label)
+        })
+        
+    return pd.DataFrame(rankings)
