@@ -1,5 +1,5 @@
-"""Download yfinance price history into a per-ticker CSV cache."""
-#python src/download_prices.py tickers.txt --start 2018-01-01
+"""Download weekly adjusted prices, momentum features, and fundamental metrics into a per-ticker CSV cache."""
+# python src/download_prices.py stock_symbols.txt --start 2018-01-01
 
 from __future__ import annotations
 
@@ -10,11 +10,28 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
-CACHE_COLUMNS = ["date", "ticker", "adj_close", "volume"]
-SECTOR_COLUMN = "sector"
+CACHE_COLUMNS = [
+    "date",
+    "ticker",
+    "adj_close",
+    "volume",
+    "sector",
+    "return_4w",
+    "return_12w",
+    "return_26w",
+    "return_52w",
+    "ma_10w_ratio",
+    "ma_40w_ratio",
+    "volatility_12w",
+    "roe",
+    "debt_to_equity",
+    "revenue_growth",
+    "profit_margin",
+]
 BENCHMARK_TICKERS = {"SPY", "QQQ"}
 TICKER_PATTERN = re.compile(r"^[A-Z0-9.^=-]+$")
 
@@ -35,8 +52,10 @@ def load_tickers(tickers_file: Path) -> list[str]:
         for row in rows[1:] if ticker_column is not None else rows:
             if not row:
                 continue
-            values = [row[ticker_column]] if ticker_column is not None and len(row) > ticker_column else (
-                [] if ticker_column is not None else row
+            values = (
+                [row[ticker_column]]
+                if ticker_column is not None and len(row) > ticker_column
+                else ([] if ticker_column is not None else row)
             )
             for value in values:
                 ticker = value.strip().upper()
@@ -57,8 +76,7 @@ def _price_field(data: pd.DataFrame, field: str) -> pd.Series:
     matching_columns = [
         column
         for column in data.columns
-        if any(str(part).casefold() == field.casefold()
-               for part in (column if isinstance(column, tuple) else (column,)))
+        if any(str(part).casefold() == field.casefold() for part in (column if isinstance(column, tuple) else (column,)))
     ]
     if len(matching_columns) != 1:
         raise ValueError(
@@ -74,12 +92,51 @@ def _price_field(data: pd.DataFrame, field: str) -> pd.Series:
     return values
 
 
+def _fetch_metadata(ticker: str) -> dict:
+    """Fetch sector, profitability, balance sheet, and growth metrics from Yahoo Finance."""
+    try:
+        info = yf.Ticker(ticker).get_info()
+    except Exception as error:
+        raise RuntimeError(f"Could not retrieve Yahoo Finance metadata for {ticker}") from error
+
+    if not isinstance(info, dict):
+        info = {}
+
+    return {
+        "sector": info.get("sector"),
+        "roe": info.get("returnOnEquity"),
+        "debt_to_equity": info.get("debtToEquity"),
+        "revenue_growth": info.get("revenueGrowth"),
+        "profit_margin": info.get("profitMargins"),
+    }
+
+
+def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute weekly price momentum, trend, and volatility features."""
+    close = df["adj_close"]
+    returns = close.pct_change()
+
+    df["return_4w"] = close.pct_change(4)
+    df["return_12w"] = close.pct_change(12)
+    df["return_26w"] = close.pct_change(26)
+    df["return_52w"] = close.pct_change(52)
+
+    ma_10 = close.rolling(window=10).mean()
+    ma_40 = close.rolling(window=40).mean()
+    df["ma_10w_ratio"] = (close - ma_10) / ma_10
+    df["ma_40w_ratio"] = (close - ma_40) / ma_40
+
+    df["volatility_12w"] = returns.rolling(window=12).std() * np.sqrt(52)
+    return df
+
+
 def _normalize_download(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if data.empty:
         raise ValueError(f"yfinance returned no price history for {ticker}")
 
     close = _price_field(data, "Close")
     volume = _price_field(data, "Volume")
+    
     result = pd.DataFrame(
         {
             "date": pd.to_datetime(data.index).strftime("%Y-%m-%d"),
@@ -88,28 +145,17 @@ def _normalize_download(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
             "volume": pd.to_numeric(volume, errors="coerce").to_numpy(),
         }
     )
-    if result[["adj_close", "volume"]].isna().any().any():
-        raise ValueError(f"Downloaded history for {ticker} contains missing or non-numeric values")
+    result = result.dropna(subset=["adj_close"])
+    if result.empty:
+        raise ValueError(f"Downloaded history for {ticker} contains no valid close prices")
+
+    result = _compute_features(result)
+    
     if (result["adj_close"] <= 0).any() or (result["volume"] < 0).any():
         raise ValueError(f"Downloaded history for {ticker} contains invalid prices or volume")
     if result["date"].duplicated().any():
         raise ValueError(f"Downloaded history for {ticker} contains duplicate dates")
-    return result[CACHE_COLUMNS]
-
-
-def _fetch_sector(ticker: str) -> Optional[str]:
-    """Fetch the current company sector from Yahoo Finance metadata."""
-    try:
-        info = yf.Ticker(ticker).get_info()
-    except Exception as error:
-        raise RuntimeError(f"Could not retrieve Yahoo Finance metadata for {ticker}") from error
-
-    sector = info.get("sector") if isinstance(info, dict) else None
-    if sector is None or not str(sector).strip():
-        if ticker not in BENCHMARK_TICKERS:
-            print(f"Warning: Yahoo Finance did not provide a sector for {ticker}.")
-        return None
-    return str(sector).strip()
+    return result
 
 
 def _save_cache(data: pd.DataFrame, cache_path: Path) -> None:
@@ -127,9 +173,9 @@ def cache_tickers(
     start: str,
     end: Optional[str] = None,
     refresh: bool = False,
-    refresh_sectors: bool = False,
+    refresh_metadata: bool = False,
 ) -> None:
-    """Cache adjusted prices and attach Yahoo's current sector to each row."""
+    """Cache weekly adjusted prices, momentum features, and fundamental metadata."""
     start_date = date.fromisoformat(start)
     end_date = date.fromisoformat(end) if end else None
     if end_date is not None and end_date <= start_date:
@@ -138,32 +184,38 @@ def cache_tickers(
     cache_dir.mkdir(parents=True, exist_ok=True)
     for ticker in tickers:
         cache_path = cache_dir / f"{ticker}.csv"
+        metadata = {}
+        
         if cache_path.exists() and not refresh:
             cached = pd.read_csv(cache_path)
             if (
                 cached.empty
-                or not set(CACHE_COLUMNS).issubset(cached.columns)
+                or not {"date", "ticker", "adj_close", "volume"}.issubset(cached.columns)
                 or not cached["ticker"].eq(ticker).all()
             ):
                 raise ValueError(
                     f"Cache file is empty or has unexpected schema/content: {cache_path}. "
                     "Use --refresh to replace it."
                 )
-            has_sector = SECTOR_COLUMN in cached.columns and (
+            
+            has_metadata = "sector" in cached.columns and (
                 ticker in BENCHMARK_TICKERS
-                or cached[SECTOR_COLUMN].fillna("").astype(str).str.strip().ne("").all()
+                or cached["sector"].fillna("").astype(str).str.strip().ne("").all()
             )
-            if has_sector and not refresh_sectors:
+            
+            if has_metadata and not refresh_metadata:
                 print(f"Using cache: {cache_path}")
                 continue
+            
             normalized = cached
-            print(f"Using cached prices; retrieving sector metadata for {ticker}...")
+            print(f"Using cached weekly prices; retrieving updated metadata for {ticker}...")
         else:
-            print(f"Downloading {ticker}...")
+            print(f"Downloading weekly data for {ticker}...")
             downloaded = yf.download(
                 ticker,
                 start=start,
                 end=end,
+                interval="1wk",
                 auto_adjust=True,
                 actions=False,
                 progress=False,
@@ -172,18 +224,33 @@ def cache_tickers(
             normalized = _normalize_download(downloaded, ticker)
 
         if ticker in BENCHMARK_TICKERS:
-            normalized[SECTOR_COLUMN] = None
-        elif refresh_sectors or SECTOR_COLUMN not in normalized.columns or (
-            normalized[SECTOR_COLUMN].fillna("").astype(str).str.strip().eq("").any()
-        ):
-            normalized[SECTOR_COLUMN] = _fetch_sector(ticker)
+            metadata = {"sector": None, "roe": None, "debt_to_equity": None, "revenue_growth": None, "profit_margin": None}
+        else:
+            meta = _fetch_metadata(ticker)
+            metadata = {
+                "sector": meta["sector"],
+                "roe": meta["roe"],
+                "debt_to_equity": meta["debt_to_equity"],
+                "revenue_growth": meta["revenue_growth"],
+                "profit_margin": meta["profit_margin"],
+            }
+
+        for col, val in metadata.items():
+            normalized[col] = val
+
+        # Ensure all CACHE_COLUMNS exist in correct order
+        for col in CACHE_COLUMNS:
+            if col not in normalized.columns:
+                normalized[col] = None
+
+        normalized = normalized[CACHE_COLUMNS]
         _save_cache(normalized, cache_path)
         print(f"Saved cache: {cache_path}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download adjusted daily prices and volume into a local CSV cache."
+        description="Download weekly adjusted prices, momentum features, and fundamental attributes into a local CSV cache."
     )
     parser.add_argument("tickers_file", type=Path, help="Text/CSV file containing ticker symbols")
     parser.add_argument("--start", default="2018-01-01", help="First date to download (YYYY-MM-DD)")
@@ -191,7 +258,7 @@ def main() -> None:
         "--end",
         help="Exclusive end date (YYYY-MM-DD); defaults to the latest available data",
     )
-    parser.add_argument("--cache-dir", type=Path, default=Path("data/prices"))
+    parser.add_argument("--cache-dir", type=Path, default=Path("stock_data"))
     parser.add_argument(
         "--benchmark",
         default="SPY",
@@ -203,9 +270,9 @@ def main() -> None:
         help="Re-download all tickers, replacing their cached CSV files",
     )
     parser.add_argument(
-        "--refresh-sectors",
+        "--refresh-metadata",
         action="store_true",
-        help="Refresh current Yahoo sector metadata without re-downloading prices",
+        help="Refresh current Yahoo sector and fundamental metadata without re-downloading price history",
     )
     args = parser.parse_args()
 
@@ -222,7 +289,7 @@ def main() -> None:
         args.start,
         args.end,
         args.refresh,
-        args.refresh_sectors,
+        args.refresh_metadata,
     )
 
 

@@ -1,3 +1,4 @@
+#some tuning parameters
 FEATURE_CONFIG = {
     "return_21d": {"enabled": False, "weight": 1.0},
     "volatility_63d": {"enabled": False, "weight": 1.0},

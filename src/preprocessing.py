@@ -1,4 +1,7 @@
+"""Weekly preprocessing pipeline for GCN stock prediction with multi-factor fundamental and momentum features."""
+
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -10,7 +13,7 @@ from config import FEATURE_CONFIG, REQUIRED_COLUMNS
 
 @dataclass
 class Snapshot:
-    """One monthly graph and its forward 21-session outcomes."""
+    """One monthly/quarterly graph snapshot and its forward return outcomes."""
     date: pd.Timestamp
     target_end: pd.Timestamp
     tickers: Tuple[str, ...]
@@ -21,6 +24,7 @@ class Snapshot:
     spy_return: float
     qqq_return: Optional[float]
     sectors: Tuple[Optional[str], ...]
+
 
 def load_price_cache(
     cache_dir: Path, benchmark_ticker: str = "SPY"
@@ -49,14 +53,18 @@ def load_price_cache(
     all_prices = panel.pivot(index="date", columns="ticker", values="adj_close").sort_index()
     all_volumes = panel.pivot(index="date", columns="ticker", values="volume").sort_index()
     
-    # Optional columns check
+    # Load optional/feature panels
     optional_panels = {}
-    for col in ["sector", "beta", "pe_ratio"]:
+    feature_keys = [
+        "sector", "return_4w", "return_12w", "return_26w", "return_52w",
+        "ma_10w_ratio", "ma_40w_ratio", "volatility_12w",
+        "roe", "debt_to_equity", "revenue_growth", "profit_margin"
+    ]
+    for col in feature_keys:
         if col in panel.columns:
             optional_panels[col] = panel.pivot(index="date", columns="ticker", values=col).sort_index()
             
     stock_columns = [col for col in all_prices.columns if col != benchmark_ticker]
-    
     sectors = optional_panels.get("sector", pd.DataFrame(index=all_prices.index)).reindex(columns=stock_columns)
     
     return (
@@ -66,6 +74,7 @@ def load_price_cache(
         sectors,
         optional_panels
     )
+
 
 def correlation_adjacency(correlations: np.ndarray, edges_per_node: int) -> np.ndarray:
     node_count = correlations.shape[0]
@@ -85,6 +94,7 @@ def correlation_adjacency(correlations: np.ndarray, edges_per_node: int) -> np.n
     inverse_sqrt_degree = np.power(degree, -0.5, where=degree > 0)
     normalized = inverse_sqrt_degree[:, None] * adjacency * inverse_sqrt_degree[None, :]
     return normalized.astype(np.float32)
+
 
 def chronological_split(
     snapshots: Sequence[Snapshot],
@@ -109,6 +119,7 @@ def chronological_split(
     
     return train, validation, test
 
+
 def build_snapshots(
     prices: pd.DataFrame,
     volumes: pd.DataFrame,
@@ -116,24 +127,29 @@ def build_snapshots(
     optional_panels: Dict[str, pd.DataFrame] = None,
     benchmark_ticker: str = "SPY",
     qqq_ticker: str = "QQQ",
-    correlation_window: int = 60,
+    correlation_window: int = 52,        # 52 weeks (~1 year) for long-term correlation structure
     edges_per_node: int = 5,
     minimum_correlation_observations: int = 40,
-    horizon: int = 21,
+    horizon: int = 12,                  # 12 weeks (~3 months) forward holding horizon for long-term picks
     sectors: Optional[pd.DataFrame] = None,
 ) -> List[Snapshot]:
-    daily_returns = prices.pct_change(fill_method=None)
+    weekly_returns = prices.pct_change(fill_method=None)
     benchmark_returns = benchmark_prices[benchmark_ticker].pct_change(fill_method=None)
     dates = prices.index
+    
+    # Create monthly snapshot cadence from weekly rows
     monthly_indices = pd.Series(np.arange(len(dates)), index=dates).groupby(dates.to_period("M")).last()
     snapshots: List[Snapshot] = []
     
     for raw_index in monthly_indices:
         index = int(raw_index)
         end_index = index + horizon
-        feature_index = index - 1
-        if feature_index < 80 or end_index >= len(dates):
+        feature_index = index
+        
+        # Ensure enough history for correlation window (52 weeks) and forward horizon
+        if feature_index < correlation_window or end_index >= len(dates):
             continue
+            
         snapshot_date, target_end = dates[index], dates[end_index]
         benchmark_start = benchmark_prices[benchmark_ticker].iloc[index]
         benchmark_end = benchmark_prices[benchmark_ticker].iloc[end_index]
@@ -150,66 +166,47 @@ def build_snapshots(
 
         feature_date = dates[feature_index]
         trailing_start = max(0, feature_index - correlation_window + 1)
-        trailing_returns = daily_returns.iloc[trailing_start : feature_index + 1]
+        trailing_returns = weekly_returns.iloc[trailing_start : feature_index + 1]
         
         features, valid_tickers, valid_indices, stock_forward_returns, snapshot_sectors = [], [], [], [], []
+        
         for ticker_index, ticker in enumerate(prices.columns):
-            close, volume = prices[ticker], volumes[ticker]
-            start_price = close.iloc[feature_index - horizon]
-            current_price = close.iloc[feature_index]
+            close = prices[ticker]
             execution_price = close.iloc[index]
             end_price = close.iloc[end_index]
-            recent_returns = daily_returns[ticker].iloc[feature_index - 62 : feature_index + 1]
-            recent_volumes = volume.iloc[feature_index - 19 : feature_index + 1]
-            prior_volumes = volume.iloc[feature_index - 79 : feature_index - 19]
             corr_values = trailing_returns[ticker]
             
             if (
-                pd.isna(start_price) or pd.isna(current_price) or pd.isna(execution_price) or pd.isna(end_price)
-                or start_price <= 0 or current_price <= 0 or execution_price <= 0
-                or recent_returns.notna().sum() < 60 or recent_volumes.isna().any()
-                or prior_volumes.isna().any() or prior_volumes.mean() <= 0
+                pd.isna(execution_price) or pd.isna(end_price) or execution_price <= 0
                 or corr_values.notna().sum() < minimum_correlation_observations
             ):
                 continue
                 
-            # Compute base metrics
-            ret_21d = float(current_price / start_price - 1.0)
-            vol_63d = float(recent_returns.std(ddof=1) * np.sqrt(252.0))
-            vol_change = float(recent_volumes.mean() / prior_volumes.mean() - 1.0)
-            
-            # Compute or lookup Beta dynamically if enabled and not in panel
-            beta_val = 1.0
-            if FEATURE_CONFIG["beta"]["enabled"]:
-                if "beta" in optional_panels and ticker in optional_panels["beta"].columns and feature_date in optional_panels["beta"].index:
-                    beta_val = float(optional_panels["beta"].at[feature_date, ticker])
-                else:
-                    # Fallback: calculate rolling beta against SPY
-                    m_ret = benchmark_returns.iloc[feature_index - 62 : feature_index + 1]
-                    valid_pair = pd.concat([recent_returns, m_ret], axis=1).dropna()
-                    if len(valid_pair) > 30:
-                        cov = np.cov(valid_pair.iloc[:, 0], valid_pair.iloc[:, 1])[0, 1]
-                        m_var = valid_pair.iloc[:, 1].var()
-                        beta_val = float(cov / m_var) if m_var > 0 else 1.0
-
-            # Lookup P/E ratio if enabled and present in data
-            pe_val = 0.0
-            if FEATURE_CONFIG["pe_ratio"]["enabled"]:
-                if "pe_ratio" in optional_panels and ticker in optional_panels["pe_ratio"].columns and feature_date in optional_panels["pe_ratio"].index:
-                    pe_val = float(optional_panels["pe_ratio"].at[feature_date, ticker])
+            # Helper to safely extract feature value from optional panels
+            def get_feat(name: str) -> float:
+                if optional_panels and name in optional_panels and ticker in optional_panels[name].columns:
+                    val = optional_panels[name].at[feature_date, ticker] if feature_date in optional_panels[name].index else np.nan
+                    return float(val) if pd.notna(val) else 0.0
+                return 0.0
 
             # Assemble node feature vector based on active config and weights
             node_features = []
-            if FEATURE_CONFIG["return_21d"]["enabled"]:
-                node_features.append(ret_21d * FEATURE_CONFIG["return_21d"]["weight"])
-            if FEATURE_CONFIG["volatility_63d"]["enabled"]:
-                node_features.append(vol_63d * FEATURE_CONFIG["volatility_63d"]["weight"])
-            if FEATURE_CONFIG["volume_change"]["enabled"]:
-                node_features.append(vol_change * FEATURE_CONFIG["volume_change"]["weight"])
-            if FEATURE_CONFIG["beta"]["enabled"]:
-                node_features.append(beta_val * FEATURE_CONFIG["beta"]["weight"])
-            if FEATURE_CONFIG["pe_ratio"]["enabled"]:
-                node_features.append(pe_val * FEATURE_CONFIG["pe_ratio"]["weight"])
+            feature_keys = [
+                "return_4w", "return_12w", "return_26w", "return_52w",
+                "ma_10w_ratio", "ma_40w_ratio", "volatility_12w",
+                "roe", "debt_to_equity", "revenue_growth", "profit_margin"
+            ]
+            
+            valid_feat = True
+            for f_key in feature_keys:
+                if FEATURE_CONFIG.get(f_key, {}).get("enabled", False):
+                    val = get_feat(f_key)
+                    if not np.isfinite(val):
+                        valid_feat = val = 0.0
+                    node_features.append(val * FEATURE_CONFIG[f_key]["weight"])
+
+            if not valid_feat:
+                continue
 
             node_features_arr = np.asarray(node_features, dtype=np.float32)
             if not np.isfinite(node_features_arr).all():
@@ -233,6 +230,7 @@ def build_snapshots(
 
         if len(valid_tickers) < 2:
             continue
+            
         return_window = trailing_returns.iloc[:, valid_indices]
         correlations = return_window.corr(min_periods=minimum_correlation_observations).to_numpy()
         adjacency = correlation_adjacency(correlations, edges_per_node)
