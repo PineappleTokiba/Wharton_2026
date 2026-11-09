@@ -51,11 +51,19 @@ class NodeMLP(nn.Module):
         return self.layers(features).squeeze(-1)
 
 
-def standardization_parameters(snapshots: Sequence[Snapshot]) -> Tuple[np.ndarray, np.ndarray]:
+def standardization_parameters(
+    snapshots: Sequence[Snapshot], feature_weights: Optional[np.ndarray] = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Fit the scaler. Snapshot features are already multiplied by their weights, and plain
+    z-scoring would cancel that out, so the scale is divided by the weights to preserve it:
+    a feature's normalized value becomes weight * z-score.
+    """
     values = np.concatenate([snapshot.features for snapshot in snapshots], axis=0)
     mean = values.mean(axis=0)
     standard_deviation = values.std(axis=0)
     standard_deviation[standard_deviation < 1e-8] = 1.0
+    if feature_weights is not None:
+        standard_deviation = standard_deviation / feature_weights
     return mean.astype(np.float32), standard_deviation.astype(np.float32)
 
 

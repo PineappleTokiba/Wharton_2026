@@ -2,6 +2,34 @@
 
 This project starts after the stock universe has been supplied. It includes an optional downloader that fetches historical prices and volume for those tickers and caches them locally. The goal is to test whether relationships between stocks help rank likely market outperformers, and whether those rankings produce a diversified portfolio after costs.
 
+## Quick start: training profiles
+
+`run.py` trains on the weekly cache in `stock_data/`. Choose what the model optimizes for with `--profile`, or change `DEFAULT_PROFILE` in `config.py`:
+
+```bash
+python run.py --profile potential   # high-upside growth (default)
+python run.py --profile stability   # long, slow, steady growth
+python test.py --profile stability  # re-evaluate the saved checkpoint
+```
+
+| | `potential` | `stability` |
+|---|---|---|
+| Positive label (over 52 weeks) | Stock beat SPY | Stock gained at least 5%, with volatility and max drawdown both at or better than the universe median |
+| Feature emphasis | Momentum, revenue growth | Trailing volatility and drawdown, long-term trend, profitability |
+| Portfolio | Top 10, 10% per name, 25% per sector | Top 20, 5% per name, 20% per sector |
+
+Profiles live in `TRAINING_PROFILES` in `config.py`. Other useful options are `--model-type {gcn,mlp}`, `--seed`, and `--no-fundamentals`. Checkpoints, including their feature scaler, are saved to `checkpoints/`.
+
+How to read the results:
+
+- Each snapshot's return covers 52 weeks and snapshots are monthly, so results are overlapping cohorts. They are averaged, not compounded, and are not an investable equity curve.
+- The test window holds 14 overlapping cohorts from one market period, so it amounts to very few independent observations.
+- `stock_data/` fundamentals are current values repeated over history, which is look-ahead. `--no-fundamentals` removes them.
+- The universe is today's ticker list, which adds survivorship bias. Compare against the `equal_weight` row rather than SPY alone.
+- Top picks are for the latest snapshot with a known 52-week outcome, so they are about a year old and are not current recommendations.
+
+The sections below describe the original research design. `src/gnn_framework.py` is the older daily reference implementation; the current pipeline is `run.py` with `src/preprocessing.py`, `src/training.py`, and `src/analysis.py`.
+
 ## 1. Research question and experiment rules
 
 At each monthly rebalance date, rank the available stocks by their predicted probability of outperforming the market over the next month. Compare a graph neural network (GNN) with:
@@ -21,7 +49,7 @@ python -m pip install -r requirements.txt
 python src/download_prices.py tickers.txt --start 2018-01-01
 ```
 
-Each symbol is saved as `data/prices/<TICKER>.csv`, with `date`, `ticker`, `adj_close`, `volume`, and `sector` columns. The downloader uses `auto_adjust=True`, so yfinance's `Close` is stored as `adj_close`; no second adjustment should be applied. It adds Yahoo Finance's current company sector to every historical row. Existing price files are reused; if they lack sector data, rerun the downloader to fetch and add it without downloading prices again. Use `--refresh-sectors` to update sector metadata without refreshing prices, `--refresh` to replace cached prices, `--end YYYY-MM-DD` for an exclusive end date, or `--cache-dir PATH` to change the cache location. If you change the requested date range, refresh the cache so the files reflect it.
+Each symbol is saved as `data/prices/<TICKER>.csv`, with `date`, `ticker`, `adj_close`, `volume`, and `sector` columns. The downloader uses `auto_adjust=True`, so yfinance's `Close` is stored as `adj_close`; no second adjustment should be applied. It adds Yahoo Finance's current company sector to every historical row. Existing price files are reused; if they lack sector data, rerun the downloader to fetch and add it without downloading prices again. Use `--refresh-metadata` to update sector and fundamental metadata without refreshing prices, `--refresh` to replace cached prices, `--end YYYY-MM-DD` for an exclusive end date, or `--cache-dir PATH` to change the cache location. If you change the requested date range, refresh the cache so the files reflect it.
 
 Yahoo Finance's sector metadata is current, not historical point-in-time classification. Repeating today's sector across past rows is convenient for a prototype but can introduce lookahead/misclassification if a company changed sectors. For a rigorous backtest, replace it with sector classifications and universe membership recorded as of each date. A supplied list of today's tickers does not establish historical index membership; using it for the full history can introduce survivorship bias, so obtain historical eligible-universe membership where possible. If Yahoo does not return a sector for an equity, the downloader warns and leaves the field blank; network/API errors are raised instead of being silently ignored.
 

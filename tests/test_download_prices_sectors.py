@@ -39,7 +39,7 @@ class DownloadPriceSectorsTests(unittest.TestCase):
             cached = pd.read_csv(cache_dir / "AAPL.csv")
             self.assertEqual(cached["sector"].tolist(), ["Technology", "Technology"])
 
-    def test_refresh_sectors_updates_metadata_without_price_download(self):
+    def test_refresh_metadata_updates_metadata_without_price_download(self):
         with tempfile.TemporaryDirectory() as directory:
             cache_dir = Path(directory)
             pd.DataFrame(
@@ -58,7 +58,7 @@ class DownloadPriceSectorsTests(unittest.TestCase):
 
             with patch("src.download_prices.yf.download") as download:
                 with patch("src.download_prices.yf.Ticker", return_value=ticker):
-                    cache_tickers(["AAPL"], cache_dir, "2024-01-01", refresh_sectors=True)
+                    cache_tickers(["AAPL"], cache_dir, "2024-01-01", refresh_metadata=True)
 
             download.assert_not_called()
             self.assertEqual(

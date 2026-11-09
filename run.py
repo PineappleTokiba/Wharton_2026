@@ -1,28 +1,58 @@
-"""End-to-end workflow runner for the Weekly GCN Stock Prediction Model."""
-#python run.py stock_symbols.txt --model-type gcn
+"""End-to-end workflow runner for the Weekly GCN Stock Prediction Model.
+
+python run.py --profile potential    # high-upside growth (default)
+python run.py --profile stability    # long, slow, steady growth
+"""
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import sys
+import random
 
+import numpy as np
 import pandas as pd
+import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from src.preprocessing import load_price_cache, build_snapshots, chronological_split
+from config import DEFAULT_PROFILE, SNAPSHOT_CONFIG, SPLIT_CONFIG, TRAINING_PROFILES, get_profile
+from src.preprocessing import (
+    build_snapshots,
+    chronological_split,
+    enabled_features,
+    feature_weights,
+    load_price_cache,
+)
 from src.training import StockGNN, NodeMLP, standardization_parameters, train_model
-from src.analysis import predict_probabilities, portfolio_backtest, performance_summary, get_snapshot_rankings
+from src.analysis import (
+    benchmark_backtest,
+    get_snapshot_rankings,
+    performance_summary,
+    portfolio_backtest,
+    predict_probabilities,
+    ranking_skill,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run GCN stock prediction and portfolio backtest pipeline.")
+    parser.add_argument("--profile", choices=sorted(TRAINING_PROFILES), default=DEFAULT_PROFILE, help="What to train for: high-upside growth (potential) or long, slow growth (stability)")
+    parser.add_argument("--no-fundamentals", action="store_true", help="Drop fundamentals, which are current values repeated over history and so leak future information")
     parser.add_argument("--cache-dir", type=Path, default=Path("stock_data"), help="Directory containing cached ticker CSVs")
     parser.add_argument("--benchmark", default="SPY", help="Benchmark ticker")
     parser.add_argument("--model-type", choices=["gcn", "mlp"], default="gcn", help="Model architecture to train")
     parser.add_argument("--epochs", type=int, default=150, help="Maximum training epochs")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--seed", type=int, default=7, help="Random seed")
+    parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"), help="Where to save the trained model")
     args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    profile = get_profile(args.profile, include_fundamentals=not args.no_fundamentals)
+    portfolio = profile["portfolio"]
+    print(f"Profile: {profile['name']} - {profile['description']}")
+    print(f"Features: {', '.join(enabled_features(profile))}")
 
     print("=" * 60)
     print("STEP 1: Loading Weekly Price & Fundamental Cache...")
@@ -40,23 +70,26 @@ def main() -> None:
         optional_panels=optional_panels,
         benchmark_ticker=args.benchmark,
         sectors=sectors,
+        profile=profile,
+        **SNAPSHOT_CONFIG,
     )
-    print(f"Generated {len(snapshots)} valid monthly/quarterly snapshots.")
+    print(f"Generated {len(snapshots)} valid monthly snapshots.")
     if not snapshots:
         raise RuntimeError("No snapshots generated. Check your date ranges or data filters.")
 
     print("\n" + "=" * 60)
     print("STEP 3: Chronological Train/Val/Test Split...")
     print("=" * 60)
-    train_snapshots, val_snapshots, test_snapshots = chronological_split(snapshots)
+    train_snapshots, val_snapshots, test_snapshots = chronological_split(snapshots, **SPLIT_CONFIG)
     print(f"Train snapshots: {len(train_snapshots)}")
     print(f"Validation snapshots: {len(val_snapshots)}")
     print(f"Test snapshots: {len(test_snapshots)}")
+    print(f"Training positive rate: {np.mean([s.labels.mean() for s in train_snapshots]):.3f}")
 
     print("\n" + "=" * 60)
     print("STEP 4: Normalizing Features & Initializing Model...")
     print("=" * 60)
-    mean, std = standardization_parameters(train_snapshots)
+    mean, std = standardization_parameters(train_snapshots, feature_weights(profile))
     input_size = train_snapshots[0].features.shape[1]
 
     if args.model_type == "gcn":
@@ -81,40 +114,63 @@ def main() -> None:
     )
     print("Training complete! Best model checkpoint loaded.")
 
+    # The scaler and settings are saved with the weights: the model is unusable without them.
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "_no_fundamentals" if args.no_fundamentals else ""
+    model_path = args.checkpoint_dir / f"{args.model_type}_{profile['name']}{suffix}.pt"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_type": args.model_type,
+            "profile": profile["name"],
+            "include_fundamentals": not args.no_fundamentals,
+            "feature_names": enabled_features(profile),
+            "feature_mean": torch.from_numpy(mean),
+            "feature_std": torch.from_numpy(std),
+            "seed": args.seed,
+            "train_cutoff": str(train_snapshots[-1].date.date()),
+        },
+        model_path,
+    )
+    print(f"Model successfully saved to {model_path}")
+
     print("\n" + "=" * 60)
     print("STEP 6: Running Portfolio Backtest on Test Set...")
     print("=" * 60)
     test_predictions = predict_probabilities(model, test_snapshots, mean, std)
-    # Save the trained model weights to disk
-    model_path = Path("gcn_stock_model.pt")
-    torch.save(model.state_dict(), model_path)
-    print(f"Model successfully saved to {model_path}")
-    # Backtest GCN / Model Strategy
-    gcn_backtest = portfolio_backtest(
+
+    model_backtest = portfolio_backtest(
         snapshots=test_snapshots,
         predictions=test_predictions,
-        strategy="gcn_top_10",
-        top_k=10,
-        max_position=0.10,
-        max_sector=0.25,
+        strategy=f"{args.model_type}_{profile['name']}_top_{portfolio['top_k']}",
         cost_rate=0.001,
+        prices=prices,
+        independent_cohorts=True,
+        **portfolio,
     )
-
-    # Backtest Equal-Weight Baseline Strategy
     eq_backtest = portfolio_backtest(
         snapshots=test_snapshots,
         predictions=test_predictions,
         strategy="equal_weight",
+        prices=prices,
+        independent_cohorts=True,
+    )
+    spy_backtest = benchmark_backtest(test_snapshots, benchmark_prices[args.benchmark.upper()], args.benchmark.upper())
+
+    summary_df = performance_summary(pd.concat([model_backtest, eq_backtest, spy_backtest], ignore_index=True))
+
+    print("\n--- Performance Summary (overlapping cohorts, averaged; not an investable equity curve) ---")
+    print(summary_df.round(3).to_string(index=False))
+
+    skill = ranking_skill(test_snapshots, test_predictions, portfolio["top_k"])
+    print(f"\n--- Ranking Skill vs '{profile['target']['type']}' target ---")
+    print(
+        f"Mean AUC: {skill['mean_auc']:.3f} (0.5 = no skill) | "
+        f"Precision@{portfolio['top_k']}: {skill['precision_at_k']:.3f} | Base rate: {skill['base_rate']:.3f}"
     )
 
-    combined_backtest = pd.concat([gcn_backtest, eq_backtest], ignore_index=True)
-    summary_df = performance_summary(combined_backtest)
-
-    print("\n--- Performance Summary ---")
-    print(summary_df.to_string(index=False))
-
     print("\n" + "=" * 60)
-    print("STEP 7: Top Long-Term Picks (Latest Test Snapshot)...")
+    print("STEP 7: Top Picks (Latest Test Snapshot)...")
     print("=" * 60)
     latest_snapshot = test_snapshots[-1]
     latest_preds = test_predictions[-1]

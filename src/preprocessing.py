@@ -8,7 +8,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from config import FEATURE_CONFIG, REQUIRED_COLUMNS
+from config import REQUIRED_COLUMNS, SNAPSHOT_CONFIG, get_profile
+
+WEEKS_PER_YEAR = 52
 
 
 @dataclass
@@ -49,7 +51,9 @@ def load_price_cache(
 
     panel = pd.concat(frames, ignore_index=True)
     benchmark_ticker = benchmark_ticker.upper()
-    
+    if benchmark_ticker not in set(panel["ticker"]):
+        raise ValueError(f"Benchmark {benchmark_ticker} is not cached in {cache_dir}")
+
     all_prices = panel.pivot(index="date", columns="ticker", values="adj_close").sort_index()
     all_volumes = panel.pivot(index="date", columns="ticker", values="volume").sort_index()
     
@@ -64,7 +68,7 @@ def load_price_cache(
         if col in panel.columns:
             optional_panels[col] = panel.pivot(index="date", columns="ticker", values=col).sort_index()
             
-    stock_columns = [col for col in all_prices.columns if col != benchmark_ticker]
+    stock_columns = [col for col in all_prices.columns if col not in {benchmark_ticker, "QQQ"}]
     sectors = optional_panels.get("sector", pd.DataFrame(index=all_prices.index)).reindex(columns=stock_columns)
     
     return (
@@ -91,9 +95,45 @@ def correlation_adjacency(correlations: np.ndarray, edges_per_node: int) -> np.n
             adjacency[other, node] = max(adjacency[other, node], weight)
     np.fill_diagonal(adjacency, 1.0)
     degree = adjacency.sum(axis=1)
-    inverse_sqrt_degree = np.power(degree, -0.5, where=degree > 0)
+    inverse_sqrt_degree = np.power(degree, -0.5, where=degree > 0, out=np.zeros_like(degree))
     normalized = inverse_sqrt_degree[:, None] * adjacency * inverse_sqrt_degree[None, :]
     return normalized.astype(np.float32)
+
+
+def path_risk(path: np.ndarray) -> Tuple[float, float]:
+    """Annualized volatility and max drawdown (as a positive fraction) of a weekly value path."""
+    path = np.asarray(path, dtype=np.float64)
+    if len(path) < 3 or (path <= 0).any():
+        return float("nan"), float("nan")
+    volatility = float(np.std(path[1:] / path[:-1] - 1.0, ddof=1) * np.sqrt(WEEKS_PER_YEAR))
+    drawdown = float((1.0 - path / np.maximum.accumulate(path)).max())
+    return volatility, drawdown
+
+
+def enabled_features(profile: dict) -> List[str]:
+    return [name for name, settings in profile["features"].items() if settings["enabled"]]
+
+
+def feature_weights(profile: dict) -> np.ndarray:
+    return np.array([profile["features"][name]["weight"] for name in enabled_features(profile)], dtype=np.float32)
+
+
+def make_labels(
+    target: dict, stock_returns: np.ndarray, benchmark_return: float,
+    forward_volatility: np.ndarray, forward_drawdown: np.ndarray,
+) -> np.ndarray:
+    """Turn a snapshot's forward outcomes into the binary target a profile trains on."""
+    if target["type"] == "beat_benchmark":
+        labels = stock_returns > benchmark_return
+    elif target["type"] == "steady_growth":
+        labels = (
+            (stock_returns >= target["min_return"])
+            & (forward_volatility <= np.nanquantile(forward_volatility, target["max_volatility_quantile"]))
+            & (forward_drawdown <= np.nanquantile(forward_drawdown, target["max_drawdown_quantile"]))
+        )
+    else:
+        raise ValueError(f"Unknown target type: {target['type']!r}")
+    return labels.astype(np.float32)
 
 
 def chronological_split(
@@ -116,7 +156,13 @@ def chronological_split(
     train = [item for item in ordered[:val_index] if item.target_end < val_start]
     validation = [item for item in ordered[val_index:test_index] if item.date >= val_start and item.target_end < test_start]
     test = [item for item in ordered[test_index:] if item.date >= test_start]
-    
+
+    if not train or not validation or not test:
+        raise ValueError(
+            f"A split is empty after purging overlapping labels (train={len(train)}, "
+            f"validation={len(validation)}, test={len(test)}, from {len(ordered)} snapshots). "
+            "Add history, shorten the horizon, or adjust the split fractions."
+        )
     return train, validation, test
 
 
@@ -127,12 +173,20 @@ def build_snapshots(
     optional_panels: Dict[str, pd.DataFrame] = None,
     benchmark_ticker: str = "SPY",
     qqq_ticker: str = "QQQ",
-    correlation_window: int = 104,        # 52 weeks (~1 year) for long-term correlation structure
-    edges_per_node: int = 7,
+    correlation_window: int = SNAPSHOT_CONFIG["correlation_window"],
+    edges_per_node: int = SNAPSHOT_CONFIG["edges_per_node"],
     minimum_correlation_observations: int = 80,
-    horizon: int = 52,                  # 12 weeks (~3 months) forward holding horizon for long-term picks
+    horizon: int = SNAPSHOT_CONFIG["horizon"],
     sectors: Optional[pd.DataFrame] = None,
+    profile: Optional[dict] = None,
 ) -> List[Snapshot]:
+    """Build monthly graphs. `profile` selects features and target (default: DEFAULT_PROFILE).
+
+    Features use data through the close before each rebalance; labels use later closes.
+    """
+    profile = profile if profile is not None else get_profile()
+    active_features = enabled_features(profile)
+    feature_scale = feature_weights(profile)
     weekly_returns = prices.pct_change(fill_method=None)
     benchmark_returns = benchmark_prices[benchmark_ticker].pct_change(fill_method=None)
     dates = prices.index
@@ -144,9 +198,9 @@ def build_snapshots(
     for raw_index in monthly_indices:
         index = int(raw_index)
         end_index = index + horizon
-        feature_index = index
-        
-        # Ensure enough history for correlation window (52 weeks) and forward horizon
+        feature_index = index - 1
+
+        # Ensure enough history for the correlation window and the forward horizon
         if feature_index < correlation_window or end_index >= len(dates):
             continue
             
@@ -169,6 +223,7 @@ def build_snapshots(
         trailing_returns = weekly_returns.iloc[trailing_start : feature_index + 1]
         
         features, valid_tickers, valid_indices, stock_forward_returns, snapshot_sectors = [], [], [], [], []
+        forward_volatility, forward_drawdown = [], []
         
         for ticker_index, ticker in enumerate(prices.columns):
             close = prices[ticker]
@@ -182,36 +237,23 @@ def build_snapshots(
             ):
                 continue
                 
-            # Helper to safely extract feature value from optional panels
+            trailing_volatility, trailing_drawdown = path_risk(
+                close.iloc[max(0, feature_index - WEEKS_PER_YEAR) : feature_index + 1].ffill().dropna().to_numpy()
+            )
+            derived = {"volatility_52w": trailing_volatility, "max_drawdown_52w": trailing_drawdown}
+
             def get_feat(name: str) -> float:
-                if optional_panels and name in optional_panels and ticker in optional_panels[name].columns:
+                """Feature value at the feature date; missing or non-finite values become 0."""
+                if name in derived:
+                    val = derived[name]
+                elif optional_panels and name in optional_panels and ticker in optional_panels[name].columns:
                     val = optional_panels[name].at[feature_date, ticker] if feature_date in optional_panels[name].index else np.nan
-                    return float(val) if pd.notna(val) else 0.0
-                return 0.0
+                else:
+                    val = np.nan
+                return float(val) if pd.notna(val) and np.isfinite(float(val)) else 0.0
 
-            # Assemble node feature vector based on active config and weights
-            node_features = []
-            feature_keys = [
-                "return_4w", "return_12w", "return_26w", "return_52w",
-                "ma_10w_ratio", "ma_40w_ratio", "volatility_12w",
-                "roe", "debt_to_equity", "revenue_growth", "profit_margin"
-            ]
-            
-            valid_feat = True
-            for f_key in feature_keys:
-                if FEATURE_CONFIG.get(f_key, {}).get("enabled", False):
-                    val = get_feat(f_key)
-                    if not np.isfinite(val):
-                        valid_feat = val = 0.0
-                    node_features.append(val * FEATURE_CONFIG[f_key]["weight"])
+            node_features_arr = np.array([get_feat(name) for name in active_features], dtype=np.float32) * feature_scale
 
-            if not valid_feat:
-                continue
-
-            node_features_arr = np.asarray(node_features, dtype=np.float32)
-            if not np.isfinite(node_features_arr).all():
-                continue
-                
             stock_return = float(end_price / execution_price - 1.0)
             if not np.isfinite(stock_return):
                 continue
@@ -220,6 +262,9 @@ def build_snapshots(
             valid_indices.append(ticker_index)
             features.append(node_features_arr)
             stock_forward_returns.append(stock_return)
+            volatility, drawdown = path_risk(close.iloc[index : end_index + 1].ffill().to_numpy())
+            forward_volatility.append(volatility)
+            forward_drawdown.append(drawdown)
             
             sector: Optional[str] = None
             if sectors is not None and ticker in sectors.columns and feature_date in sectors.index:
@@ -234,7 +279,10 @@ def build_snapshots(
         return_window = trailing_returns.iloc[:, valid_indices]
         correlations = return_window.corr(min_periods=minimum_correlation_observations).to_numpy()
         adjacency = correlation_adjacency(correlations, edges_per_node)
-        labels = (np.asarray(stock_forward_returns) > spy_return).astype(np.float32)
+        labels = make_labels(
+            profile["target"], np.asarray(stock_forward_returns), spy_return,
+            np.asarray(forward_volatility), np.asarray(forward_drawdown),
+        )
         
         snapshots.append(
             Snapshot(
